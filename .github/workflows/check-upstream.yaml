@@ -1,0 +1,83 @@
+name: Check for upstream btop releases
+
+# ──────────────────────────────────────────────────────────────────────────────
+# This workflow polls the btop upstream GitHub API every 6 hours.
+# If a new release tag is found (one that doesn't exist in this repo yet),
+# it pushes a matching tag here — which triggers build-amd-gpu.yaml to build
+# the binary and publish a GitHub Release automatically.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:         # allow manual trigger for testing
+
+permissions:
+  contents: write            # needed to push the new tag
+
+jobs:
+  check-upstream:
+    name: Check aristocratos/btop for new releases
+    runs-on: ubuntu-latest
+
+    steps:
+      # ──────────────────────────────────────────────
+      # 1. Fetch the latest btop release tag from the
+      #    upstream GitHub API (no auth needed for
+      #    public repos, but the token avoids rate limits)
+      # ──────────────────────────────────────────────
+      - name: Get latest upstream btop release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh release view \
+            --repo aristocratos/btop \
+            --json tagName \
+            --jq '.tagName')
+
+          echo "Latest upstream tag: $LATEST"
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────
+      # 2. Check whether we already have a release for
+      #    this tag in THIS repo
+      # ──────────────────────────────────────────────
+      - name: Check if we already built this version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if gh release view "$UPSTREAM_TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --json tagName \
+               &>/dev/null; then
+            echo "Release $UPSTREAM_TAG already exists — nothing to do."
+            echo "already_built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release found: $UPSTREAM_TAG"
+            echo "already_built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ──────────────────────────────────────────────
+      # 3. If new: checkout the repo and push a
+      #    matching tag — this triggers build-amd-gpu.yaml
+      # ──────────────────────────────────────────────
+      - name: Checkout repository
+        if: steps.check.outputs.already_built == 'false'
+        uses: actions/checkout@v4
+
+      - name: Push new tag to trigger build
+        if: steps.check.outputs.already_built == 'false'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Creating and pushing tag: $UPSTREAM_TAG"
+          git tag "$UPSTREAM_TAG"
+          git push origin "$UPSTREAM_TAG"
+
+          echo "✅ Tag $UPSTREAM_TAG pushed — build-amd-gpu.yaml will now run."
