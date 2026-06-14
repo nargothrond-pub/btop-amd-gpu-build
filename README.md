@@ -10,7 +10,7 @@
 
 <br/>
 
-![btop AMD GPU demo](https://raw.githubusercontent.com/aristocratos/btop/main/Img/normal.png)
+![btop running with AMD GPU panel — Ryzen 7 7735HS](screenshot.png)
 
 </div>
 
