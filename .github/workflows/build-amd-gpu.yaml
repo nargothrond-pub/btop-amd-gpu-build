@@ -1,0 +1,153 @@
+name: Build btop with AMD GPU Support
+
+on:
+  workflow_dispatch:
+    inputs:
+      btop_ref:
+        description: "btop branch/tag/commit to build (default: main)"
+        required: false
+        default: "main"
+  push:
+    branches: ["main"]
+  schedule:
+    # Rebuild nightly to pick up upstream fixes
+    - cron: "0 3 * * *"
+
+jobs:
+  build:
+    name: Build btop (AMD GPU)
+    runs-on: ubuntu-26.04
+
+    env:
+      BTOP_REF: ${{ github.event.inputs.btop_ref || 'main' }}
+
+    steps:
+      # ──────────────────────────────────────────────
+      # 1. Install build dependencies
+      # ──────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git \
+            g++ \
+            make \
+            lowdown
+
+      # ──────────────────────────────────────────────
+      # 2. Install ROCm SMI library (AMD GPU runtime)
+      #
+      #    btop uses dlopen() at runtime to load the
+      #    ROCm SMI shared library, so we only need
+      #    the development headers + shared lib for
+      #    compilation; the GPU won't be present on
+      #    the CI runner but the binary will support
+      #    it when deployed to an AMD machine.
+      # ──────────────────────────────────────────────
+      - name: Add ROCm apt repository
+        run: |
+          # Ubuntu 24.04 ships rocm packages in its universe repo;
+          # for newer ROCm versions use the official AMD repository.
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
+            https://repo.radeon.com/rocm/apt/latest noble main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+
+          sudo apt-get update -y
+
+      - name: Install ROCm SMI library
+        run: |
+          # rocm-smi-lib provides librocm_smi64.so needed by btop GPU support
+          sudo apt-get install -y rocm-smi-lib
+
+      # ──────────────────────────────────────────────
+      # 3. Clone btop source
+      # ──────────────────────────────────────────────
+      - name: Clone btop
+        run: |
+          git clone --depth=1 \
+            --branch "$BTOP_REF" \
+            https://github.com/aristocratos/btop.git \
+            btop-src \
+          || git clone --depth=1 \
+            https://github.com/aristocratos/btop.git \
+            btop-src
+
+      # ──────────────────────────────────────────────
+      # 4. Build
+      #
+      #    Key flags:
+      #      GPU_SUPPORT=true  - enables GPU monitoring code
+      #      STATIC=false      - required for GPU (uses dlopen)
+      #      VERBOSE=true      - full compiler output in logs
+      # ──────────────────────────────────────────────
+      - name: Build btop with AMD GPU support
+        working-directory: btop-src
+        run: |
+          make -j"$(nproc)" \
+            GPU_SUPPORT=true \
+            STATIC=false \
+            VERBOSE=true
+
+      # ──────────────────────────────────────────────
+      # 5. Sanity-check the resulting binary
+      # ──────────────────────────────────────────────
+      - name: Verify binary and GPU support
+        working-directory: btop-src
+        run: |
+          echo "=== btop version ==="
+          bin/btop --version
+
+          echo ""
+          echo "=== Dynamic libraries (should NOT be fully static) ==="
+          ldd bin/btop
+
+          echo ""
+          echo "=== GPU symbol check (should list rocm_smi references) ==="
+          strings bin/btop | grep -i "rocm\|rsmi\|amdgpu" || \
+            echo "WARNING: No ROCm symbols found - GPU support may not be active."
+
+      # ──────────────────────────────────────────────
+      # 6. Stage and upload artifact
+      # ──────────────────────────────────────────────
+      - name: Stage artifact
+        working-directory: btop-src
+        run: |
+          mkdir -p dist/btop-amdgpu/bin
+          cp bin/btop dist/btop-amdgpu/bin/
+          cp -r themes dist/btop-amdgpu/
+
+          # Capture version for artifact naming
+          VERSION=$(bin/btop --version 2>&1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || echo "unknown")
+          echo "BTOP_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Upload btop binary (AMD GPU)
+        uses: actions/upload-artifact@v4
+        with:
+          name: btop-amdgpu-linux-x86_64-${{ env.BTOP_VERSION }}
+          path: btop-src/dist/btop-amdgpu/
+          retention-days: 30
+
+      # ──────────────────────────────────────────────
+      # 7. Optional: create a GitHub Release on tags
+      # ──────────────────────────────────────────────
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: btop-src/dist/btop-amdgpu/bin/btop
+          name: "btop ${{ env.BTOP_VERSION }} (AMD GPU build)"
+          body: |
+            btop compiled from source with AMD GPU (ROCm SMI) support enabled.
+
+            Built from: aristocratos/btop@${{ env.BTOP_REF }}
+
+            ## Usage
+            Deploy this binary to a machine with ROCm installed.
+            Press `5` inside btop to show the GPU monitoring panel.
+
+            > **Note:** this binary requires `librocm_smi64.so` to be
+            > present at runtime for GPU features to work.
